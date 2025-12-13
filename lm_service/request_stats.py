@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from collections import defaultdict
+from typing import Union
 
 import zmq
 import zmq.asyncio
@@ -20,7 +21,7 @@ class RequestStatsMonitor:
     Monitors and records request statistics for all instances.
     """
 
-    def __init__(self, instances: dict[str, zmq.asyncio.Socket]):
+    def __init__(self, instances: Union[set[str], dict[str, zmq.asyncio.Socket]]):
         # Key: instance addr
         self.request_stats: dict[str, RequestStats] = defaultdict(
             lambda: RequestStats(in_flight_requests=set())

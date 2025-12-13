@@ -202,3 +202,27 @@ class HealthCheckServiceDiscovery(ServiceDiscovery):
                 self.server_type,
                 addr,
             )
+
+
+class HttpHealthCheckServiceDiscovery(ServiceDiscovery):
+    """
+    Service discovery for HTTP instances.
+    """
+    
+    def __init__(self,
+        http_addrs,
+        server_type: ServerType,
+        enable_health_monitor: bool,
+        health_check_interval: float,
+        health_threshold: int,
+        lock: asyncio.Lock,
+        health_check_func,
+    ):
+        self.http_addrs = http_addrs
+        self.server_type = server_type
+        self.enable_health_monitor = enable_health_monitor
+        self._health_check_interval = health_check_interval
+        self._health_threshold = health_threshold
+        self._lock = lock
+        self._health_check_func = health_check_func
+        
