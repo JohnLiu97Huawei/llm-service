@@ -22,26 +22,76 @@ SERVER_PARAMS_MAP = {
         "addr_list_name": "encode_addr_list",
         "run_request_type": RequestType.ENCODE,
         "socket_list_name": "to_e_sockets",
+        "url_name": "e_urls",
     },
     ServerType.P_INSTANCE: {
         "addr_list_name": "p_addr_list",
         "run_request_type": RequestType.PREFILL,
         "socket_list_name": "to_p_sockets",
+        "url_name": "p_urls",
     },
     ServerType.D_INSTANCE: {
         "addr_list_name": "d_addr_list",
         "run_request_type": RequestType.GENERATION,
         "socket_list_name": "to_d_sockets",
+        "url_name": "d_urls",
     },
     ServerType.PD_INSTANCE: {
         "addr_list_name": "d_addr_list",
         "run_request_type": RequestType.GENERATION,
         "socket_list_name": "to_d_sockets",
+        "url_name": "d_urls",
     },
 }
 
 
 class InstanceCluster:
+    """
+    Base class for per-server-type instance cluster.
+    """
+    def __init__(
+        self,
+        server_type: ServerType,
+        service_discovery: HealthCheckServiceDiscovery,
+        stats_monitor: RequestStatsMonitor,
+        router: RoutingInterface,
+        metrics_logger: MetricsReporter,
+    ):
+        self.server_type = server_type
+        self.service_discovery = service_discovery
+        self.stats_monitor = stats_monitor
+        self.router = router
+        self.metrics_logger = metrics_logger
+        
+    async def log_metrics(self) -> None:
+        await self.metrics_logger.log_metrics()
+
+    def _get_health_endpoints(self):
+        return self.service_discovery.get_health_endpoints()
+
+    def _route_request(self, health_endpoints, request_stats):
+        return self.router.route_request(health_endpoints, request_stats)
+
+    def lazy_init_health_monitor(self):
+        if self.should_launch_health_monitor():
+            self.launch_health_monitor()
+
+    def should_launch_health_monitor(self):
+        return self.service_discovery.should_launch_health_monitor()
+
+    def launch_health_monitor(self):
+        self.service_discovery.launch_health_monitor()
+
+    def get_unhealthy_endpoints(self):
+        return self.service_discovery.get_unhealth_endpoints()
+
+    def get_avg_proxy_ttft(self):
+        return self.metrics_logger.get_avg_proxy_ttft()
+
+    def get_avg_proxy_to_instance_time(self, addr: str) -> float:
+        return self.metrics_logger.get_avg_proxy_to_instance_time(addr)
+    
+class ZMQInstanceCluster(InstanceCluster):
     """
     Encapsulates per-server-type runtime components.
     """
@@ -56,15 +106,17 @@ class InstanceCluster:
         metrics_logger: MetricsReporter,
         socket_lock: asyncio.Lock,
     ):
-        self.server_type = server_type
+        super().__init__(
+            server_type,
+            service_discovery,
+            stats_monitor,
+            router,
+            metrics_logger,
+        )
         self.sockets = sockets
-        self.service_discovery = service_discovery
-        self.stats_monitor = stats_monitor
-        self.router = router
-        self.metrics_logger = metrics_logger
-        self.encoder = msgspec.msgpack.Encoder()
         self.socket_lock = socket_lock
-
+        self.encoder = msgspec.msgpack.Encoder()
+        
     def _prepare_msg(self, request):
         if not self.sockets:
             raise RuntimeError(f"No available {self.server_type.name} workers.")
@@ -174,31 +226,6 @@ class InstanceCluster:
                 f"without worker response."
             )
 
-    async def log_metrics(self) -> None:
-        await self.metrics_logger.log_metrics()
-
-    def _get_health_endpoints(self):
-        return self.service_discovery.get_health_endpoints()
-
-    def _route_request(self, health_endpoints, request_stats):
-        return self.router.route_request(health_endpoints, request_stats)
-
-    def lazy_init_health_monitor(self):
-        if self.should_launch_health_monitor():
-            self.launch_health_monitor()
-
-    def should_launch_health_monitor(self):
-        return self.service_discovery.should_launch_health_monitor()
-
-    def launch_health_monitor(self):
-        self.service_discovery.launch_health_monitor()
-
-    def get_unhealthy_endpoints(self):
-        return self.service_discovery.get_unhealth_endpoints()
-
-    def get_avg_proxy_ttft(self):
-        return self.metrics_logger.get_avg_proxy_ttft()
-
     def cal_proxy_ttft(
         self,
         ttft_recorded_flag: bool,
@@ -211,5 +238,28 @@ class InstanceCluster:
             response,
         )
 
-    def get_avg_proxy_to_instance_time(self, addr: str) -> float:
-        return self.metrics_logger.get_avg_proxy_to_instance_time(addr)
+
+
+
+class HttpInstanceCluster(InstanceCluster):
+    """
+    Encapsulates per-server-type runtime components.
+    """
+
+    def __init__(
+        self,
+        server_type: ServerType,
+        urls: dict[str, str],
+        service_discovery: HealthCheckServiceDiscovery,
+        stats_monitor: RequestStatsMonitor,
+        router: RoutingInterface,
+        metrics_logger: MetricsReporter,
+    ):
+        super().__init__(
+            server_type,
+            service_discovery,
+            stats_monitor,
+            router,
+            metrics_logger,
+        )
+        self.urls = urls

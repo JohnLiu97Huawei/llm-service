@@ -76,7 +76,197 @@ ROUTER_MAP = {
 }
 
 
-class Proxy(EngineClient):
+class BaseProxy(EngineClient):
+    """
+    Base Proxy class for LM-Service which defines the interface.
+    Compilable with both ZMQ message proxy and HTTP proxy.
+    """
+
+    def __init__(
+        self,
+        vllm_config: Optional[VllmConfig] = None,
+        model_name: str = "",
+        router: type[RoutingInterface] = RandomRouter,
+        enable_health_monitor: bool = True,
+        health_check_interval: float = 10.0,
+        health_threshold: int = 3,
+        log_stats: bool = True,
+        metastore_client_config: Optional[dict] = None,
+    ):
+        self.vllm_config = vllm_config
+        # Validate input parameters for some components
+        self._check_type("enable_health_monitor", enable_health_monitor, bool)
+        self._check_positive("health_check_interval", health_check_interval)
+        self._check_positive("health_threshold", health_threshold)
+        self._check_subclass("router", router, RoutingInterface)
+        self.log_stats = log_stats
+        self.enable_health_monitor = enable_health_monitor
+        self.health_check_interval = health_check_interval
+        self.health_threshold = health_threshold
+        self.is_pd_merged = True
+        self.tokenizer = (
+            init_tokenizer_from_configs(model_config=vllm_config.model_config)
+            if vllm_config
+            else None
+        )
+        self.router = router
+        self.metastore_client_config = metastore_client_config
+        self.metastore_client: Optional[MetastoreClientBase] = None
+
+        # Dummy: needed for EngineClient Protocol.
+        self.model_config = ModelConfig(
+            model=model_name,
+            tokenizer=model_name,
+            tokenizer_mode="auto",
+            trust_remote_code=False,
+            dtype="auto",
+            task="generate",
+            seed=42,
+        )
+
+    def _init_cluster_with_metastore(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def _init_cluster_with_addr_list(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def _initialize_instance_clusters(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def shutdown(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def use_metastore_client(self) -> bool:
+        return (
+            self.metastore_client_config is not None
+            or lm_service_envs.LM_SERVICE_METASTORE_CLIENT is not None
+        )
+
+    async def generate(self, *args, **kwargs):
+        raise NotImplementedError
+
+    async def start_profile(self) -> None:
+        raise NotImplementedError
+
+    async def stop_profile(self) -> None:
+        raise NotImplementedError
+
+    async def reset_prefix_cache(self, device: Optional[Device] = None) -> None:
+        raise NotImplementedError
+
+    async def sleep(self, level: int = 1) -> None:
+        raise NotImplementedError
+
+    async def wake_up(self, tags: list[str] | None = None) -> None:
+        raise NotImplementedError
+
+    async def is_sleeping(self) -> bool:
+        return False
+
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        raise NotImplementedError
+
+    @property
+    def errored(self) -> bool:
+        return False
+
+    def dead_error(self) -> Exception:
+        return Exception("PDController has failed.")
+
+    def is_running(self) -> bool:
+        return True
+
+    def is_stopped(self) -> bool:
+        return False
+
+    async def reset_mm_cache(self) -> None:
+        raise NotImplementedError
+
+    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return ("generate",)
+
+    async def _get_socket_and_server_types_from_addr(
+        self,
+        addr: str,
+        server_type: ServerType,
+    ) -> zmq.asyncio.Socket:
+        cluster = self.instance_clusters[server_type]
+        cluster_lock = cluster.socket_lock
+        async with cluster_lock:
+            socket = cluster.sockets.get(addr)
+        if socket:
+            return socket
+        raise ValueError(
+            f"Address {addr} not found in any {server_type.name} sockets."
+        )
+
+    async def _remove_instance_from_registry(
+        self, addr: str, server_type: ServerType
+    ) -> None:
+        cluster = self.instance_clusters[server_type]
+        await cluster.service_discovery.remove_instance(addr)
+
+    def _check_type(self, name, value, expected_type):
+        if not isinstance(value, expected_type):
+            raise TypeError(
+                f"{name} must be {expected_type.__name__}, ",
+                f"got {type(value).__name__}",
+            )
+
+    def _check_positive(self, name, value):
+        try:
+            if value <= 0:
+                raise ValueError
+        except Exception:
+            raise ValueError(f"{name} must be a positive number")
+
+    def _check_subclass(self, name, value, base_class):
+        if not isinstance(value, type) or not issubclass(value, base_class):
+            raise TypeError(
+                f"{name} must be a subclass of {base_class.__name__}"
+            )
+
+    def encode(
+        self,
+        prompt: PromptType,
+        pooling_params: PoolingParams,
+        request_id: str,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        priority: int = 0,
+    ) -> AsyncGenerator[PoolingRequestOutput, None]:
+        raise NotImplementedError
+
+    async def abort(self, request_id: str) -> None:
+        raise NotImplementedError
+
+    async def get_vllm_config(self) -> VllmConfig:
+        """Get the vllm configuration of the vLLM engine."""
+        raise NotImplementedError
+
+    async def get_model_config(self) -> ModelConfig:
+        return self.model_config
+
+    async def get_input_preprocessor(self) -> InputPreprocessor:
+        raise NotImplementedError
+
+    async def get_tokenizer(self) -> AnyTokenizer:
+        if self.tokenizer is None:
+            raise ValueError(
+                "Tokenizer not initialized. Ensure vllm_config "
+                "is provided when creating the Proxy instance."
+            )
+
+        return self.tokenizer
+
+    async def is_tracing_enabled(self) -> bool:
+        return False
+
+    async def do_log_stats(self) -> None:
+        pass
+
+
+class Proxy(BaseProxy):
     """
     Proxy
     """
@@ -98,12 +288,17 @@ class Proxy(EngineClient):
         metastore_client_config: Optional[dict] = None,
         log_stats: bool = True,
     ):
-        self.vllm_config = vllm_config
-        # Validate input parameters for some components
-        self._check_type("enable_health_monitor", enable_health_monitor, bool)
-        self._check_positive("health_check_interval", health_check_interval)
-        self._check_positive("health_threshold", health_threshold)
-        self._check_subclass("router", router, RoutingInterface)
+        super().__init__(
+            vllm_config=vllm_config,
+            model_name=model_name,
+            router=router,
+            enable_health_monitor=enable_health_monitor,
+            health_check_interval=health_check_interval,
+            health_threshold=health_threshold,
+            transfer_protocol=transfer_protocol,
+            metastore_client_config=metastore_client_config,
+            log_stats=log_stats,
+        )
 
         self.instance_clusters: dict[ServerType, InstanceCluster] = {}
         self.queues: dict[str, asyncio.Queue] = {}
@@ -113,40 +308,12 @@ class Proxy(EngineClient):
             lm_service_envs.TRANSFER_PROTOCOL or transfer_protocol or "ipc"
         )
         self.ctx = zmq.asyncio.Context()
-
-        self.log_stats = log_stats
-        self.enable_health_monitor = enable_health_monitor
-        self.health_check_interval = health_check_interval
-        self.health_threshold = health_threshold
         self.output_handler: Optional[asyncio.Task] = None
-        self.metastore_client: Optional[MetastoreClientBase] = None
-        self.router = router
-        self.is_pd_merged = True
-        self.tokenizer = (
-            init_tokenizer_from_configs(model_config=vllm_config.model_config)
-            if vllm_config
-            else None
-        )
-        # Dummy: needed for EngineClient Protocol.
-        self.model_config = ModelConfig(
-            model=model_name,
-            tokenizer=model_name,
-            tokenizer_mode="auto",
-            trust_remote_code=False,
-            dtype="auto",
-            task="generate",
-            seed=42,
-        )
-
         # Logically, there is no essential difference between PD instances and D instances in handling tokens.
         # Therefore, in internal processing, we treat them as equivalent to simplify the logic.
-
-        if (
-            metastore_client_config is not None
-            or lm_service_envs.LM_SERVICE_METASTORE_CLIENT is not None
-        ):
+        if self.use_metastore_client():
             self._init_cluster_with_metastore(
-                metastore_client_config, proxy_addr
+                self.metastore_client_config, proxy_addr
             )
         else:
             self._init_cluster_with_addr_list(
@@ -625,45 +792,6 @@ class Proxy(EngineClient):
             if socket is not None:
                 socket.close(linger=0)
 
-    def encode(
-        self,
-        prompt: PromptType,
-        pooling_params: PoolingParams,
-        request_id: str,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
-        priority: int = 0,
-    ) -> AsyncGenerator[PoolingRequestOutput, None]:
-        raise NotImplementedError
-
-    async def abort(self, request_id: str) -> None:
-        raise NotImplementedError
-
-    async def get_vllm_config(self) -> VllmConfig:
-        """Get the vllm configuration of the vLLM engine."""
-        raise NotImplementedError
-
-    async def get_model_config(self) -> ModelConfig:
-        return self.model_config
-
-    async def get_input_preprocessor(self) -> InputPreprocessor:
-        raise NotImplementedError
-
-    async def get_tokenizer(self) -> AnyTokenizer:
-        if self.tokenizer is None:
-            raise ValueError(
-                "Tokenizer not initialized. Ensure vllm_config "
-                "is provided when creating the Proxy instance."
-            )
-
-        return self.tokenizer
-
-    async def is_tracing_enabled(self) -> bool:
-        return False
-
-    async def do_log_stats(self) -> None:
-        pass
-
     async def check_health(self, server_type: ServerType, addr: str):
         # lazy initialization
         if self.output_handler is None:
@@ -787,87 +915,6 @@ class Proxy(EngineClient):
             else None
         )
 
-    async def start_profile(self) -> None:
-        raise NotImplementedError
-
-    async def stop_profile(self) -> None:
-        raise NotImplementedError
-
-    async def reset_prefix_cache(self, device: Optional[Device] = None) -> None:
-        raise NotImplementedError
-
-    async def sleep(self, level: int = 1) -> None:
-        raise NotImplementedError
-
-    async def wake_up(self, tags: list[str] | None = None) -> None:
-        raise NotImplementedError
-
-    async def is_sleeping(self) -> bool:
-        return False
-
-    async def add_lora(self, lora_request: LoRARequest) -> bool:
-        raise NotImplementedError
-
-    @property
-    def errored(self) -> bool:
-        return False
-
-    def dead_error(self) -> Exception:
-        return Exception("PDController has failed.")
-
-    def is_running(self) -> bool:
-        return True
-
-    def is_stopped(self) -> bool:
-        return False
-
-    async def reset_mm_cache(self) -> None:
-        raise NotImplementedError
-
-    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
-        return ("generate",)
-
-    async def _get_socket_and_server_types_from_addr(
-        self,
-        addr: str,
-        server_type: ServerType,
-    ) -> zmq.asyncio.Socket:
-        cluster = self.instance_clusters[server_type]
-        cluster_lock = cluster.socket_lock
-        async with cluster_lock:
-            socket = cluster.sockets.get(addr)
-        if socket:
-            return socket
-        raise ValueError(
-            f"Address {addr} not found in any {server_type.name} sockets."
-        )
-
-    async def _remove_instance_from_registry(
-        self, addr: str, server_type: ServerType
-    ) -> None:
-        cluster = self.instance_clusters[server_type]
-        await cluster.service_discovery.remove_instance(addr)
-
-    def _check_type(self, name, value, expected_type):
-        if not isinstance(value, expected_type):
-            raise TypeError(
-                f"{name} must be {expected_type.__name__}, ",
-                f"got {type(value).__name__}",
-            )
-
-    def _check_positive(self, name, value):
-        try:
-            if value <= 0:
-                raise ValueError
-        except Exception:
-            raise ValueError(f"{name} must be a positive number")
-
-    def _check_subclass(self, name, value, base_class):
-        if not isinstance(value, type) or not issubclass(value, base_class):
-            raise TypeError(
-                f"{name} must be a subclass of {base_class.__name__}"
-            )
-
     def get_check_health_results(self) -> dict[str, dict[str, bool]]:
         # Return health check results for each server type
         results: dict[str, dict[str, bool]] = {}
@@ -880,10 +927,210 @@ class Proxy(EngineClient):
         return results
 
 
+class HttpProxy(BaseProxy):
+    """
+    Http Proxy
+    All the process is done in HTTP method, including the request transfer and response receiving.
+    """
+
+    def __init__(
+        self,
+        e_urls: Optional[list[str]] = None,
+        p_urls: Optional[list[str]] = None,
+        d_urls: Optional[list[str]] = None,
+        vllm_config: Optional[VllmConfig] = None,
+        model_name: str = "",
+        router: type[RoutingInterface] = RandomRouter,
+        enable_health_monitor: bool = True,
+        health_check_interval: float = 10.0,
+        health_threshold: int = 3,
+        transfer_protocol: Optional[str] = None,
+        metastore_client_config: Optional[dict] = None,
+        log_stats: bool = True,
+    ):
+        super().__init__(
+            vllm_config=vllm_config,
+            model_name=model_name,
+            router=router,
+            enable_health_monitor=enable_health_monitor,
+            health_check_interval=health_check_interval,
+            health_threshold=health_threshold,
+            transfer_protocol=transfer_protocol,
+            metastore_client_config=metastore_client_config,
+            log_stats=log_stats,
+        )
+        self.instance_clusters: dict[ServerType, InstanceCluster] = {}
+        self.req_id_set = set(str)
+        if self.use_metastore_client():
+            self._init_cluster_with_metastore_http(
+                metastore_client_config, e_urls, p_urls, d_urls
+            )
+        else:
+            self._init_cluster_with_url_list(e_urls, p_urls, d_urls)
+
+    def _init_cluster_with_addr_list(
+        self,
+        e_urls: Optional[list[str]] = None,
+        p_urls: Optional[list[str]] = None,
+        d_urls: Optional[list[str]] = None,
+    ):
+        if not e_urls:
+            raise ValueError("e_urls must be provided")
+        if not d_urls:
+            raise ValueError("d_urls must be provided")
+
+        init_params = locals()
+        for server_type in SERVER_PARAMS_MAP:
+            url_param_name = SERVER_PARAMS_MAP[server_type]["url_name"]
+            urls = init_params.get(url_param_name, None)
+            if urls:
+                self._initialize_instance_clusters_http(server_type, urls)
+
+    def _initialize_instance_clusters_http(
+        self,
+        engine_type: ServerType,
+        urls: list[str],
+    ):
+        lock = asyncio.Lock()
+        service_discovery = HealthCheckServiceDiscovery(
+            server_type=engine_type,
+            instances=urls,
+            enable_health_monitor=self.enable_health_monitor,
+            health_check_interval=self.health_check_interval,
+            health_threshold=self.health_threshold,
+            health_check_func=self.check_health,
+            lock=lock,
+        )
+        metrics_logger = MetricsReporter(
+            server_type=engine_type,
+            instances=urls,
+            get_metrics_func=self.fetch_metrics_from_instance,
+        )
+        request_stats_monitor = RequestStatsMonitor(urls)
+        route_policy = f"LM_SERVICE_{engine_type.name}_ROUTER"
+        instance_router = (
+            ROUTER_MAP.get(getattr(lm_service_envs, route_policy), None)
+            or self.router
+        )()
+        self.instance_clusters[engine_type] = HttpInstanceCluster(
+            server_type=engine_type,
+            urls=urls,
+            service_discovery=service_discovery,
+            stats_monitor=request_stats_monitor,
+            router=instance_router,
+            metrics_logger=metrics_logger,
+            socket_lock=lock,
+        )
+
+    async def check_health(self, server_type: ServerType, url: str):
+        try:
+            cluster = self.instance_clusters[server_type]
+            url = cluster.urls.get(url, None)
+            session = cluster.session
+            async with session.get(f"{url}/health") as resp:
+                resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Health check failed for {url} with error: {e}")
+            return False
+
+    async def generate(
+        self,
+        req_data: dict,
+        req_id: str,
+    ):
+        try:
+            is_streaming = req_data.get("stream", False)
+            if req_id in self.req_id_set:
+                raise ValueError(f"Request id {req_id} already running.")
+            else:
+                self.req_id_set.add(req_id)
+
+                proxy_ttft_start: float = time.perf_counter()
+                ttft_recorded_flag: bool = False
+
+            # Step 1 : Encode the multimodal data if any
+            mm_items = extract_mm_items(req_data)
+            if mm_items:
+                await self._process_request(
+                    server_type=ServerType.E_INSTANCE, mm_items=mm_items
+                )
+
+            # Step 2 : Maybe Prefill
+            decode_server_type = ServerType.PD_INSTANCE
+            if not self.is_pd_merged:
+                await self._process_request(
+                    server_type=ServerType.P_INSTANCE, req_data=req_data
+                )
+                decode_server_type = ServerType.D_INSTANCE
+            # Step 3 : Decode
+            headers = {"x-request-id": req_id}
+            decode_cluster = self.instance_clusters[decode_server_type]
+            async with self._process_request_streaming_response(
+                decode_server_type, req_data, headers
+            ) as resp:
+                resp.raise_for_status()
+                ttft_recorded_flag = decode_cluster.cal_proxy_ttft(
+                    ttft_recorded_flag,
+                    proxy_ttft_start,
+                    resp,
+                )
+                if is_streaming:
+                    return await resp.json()
+                else:
+                    async for chunk in resp.content.iter_chunked(1024):
+                        if chunk:
+                            yield chunk.decode("utf-8", errors="ignore")
+        except Exception as e:
+            logger.error(f"Error during completion: {e}")
+        finally:
+            self.req_id_set.remove(req_id)
+
+    async def _process_request(
+        self,
+        server_type: ServerType,
+        req_data: dict,
+        headers: Optional[Mapping[str, str]] = None,
+    ):
+        cluster = self.instance_clusters[server_type]
+        await cluster.process_request(req_data, headers)
+
+    async def _process_request_streaming_response(
+        self,
+        server_type: ServerType,
+        req_data: dict,
+        headers: Optional[Mapping[str, str]] = None,
+    ):
+        cluster = self.instance_clusters[server_type]
+        async for resp in cluster.process_request_streaming_response(
+            req_data, headers
+        ):
+            yield resp
+
+
 def _has_mm_data(prompt: PromptType) -> bool:
     if isinstance(prompt, dict):
         return "multi_modal_data" in prompt
     return False
+
+
+def extract_mm_items(request_data: dict) -> list[dict]:
+    """
+    Return *all* image/audio items that appear anywhere in `messages`.
+
+    Each returned dict looks like:
+        { "type": "image_url", "image_url": {...} }
+    """
+    items: list[dict] = []
+    for msg in request_data.get("messages", []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if item.get("type") in {"image_url", "audio_url", "input_audio"}:
+                items.append(item)
+    return items
 
 
 def _encode_mm_data(mm_data: dict[str, Any]) -> dict[str, Any]:
